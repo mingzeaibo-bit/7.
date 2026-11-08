@@ -1,0 +1,1009 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Turn baked material maps into Unity Texture2D payloads (raw mip chains, BC compressed).
+
+    python own_textures.py atlas <bake_dir> <tag> <slots_json> <size> <out_dir> [<name_prefix>] [<extra_json>]
+    python own_textures.py single <bake_dir> <tag> <out_dir> [<name_prefix>]
+
+atlas : UDIM tiles of <tag> (from blender/bake_material_maps.py) placed into a size x size atlas, slot (sx, sy) =
+        quadrant [sx/2, sy/2] in UV space (same packing as own_body.py uv0).
+single: one tile (1001) at its baked size.
+Outputs per map: <name>.bin (all mips, largest first, Unity row order = bottom row first) + <name>.json
+  color  -> BC7  (TextureFormat 25), sRGB, alpha = baked alpha if present else 255
+  normal -> DXT5nm in BC3 (TextureFormat 12): R=255, G=y, B=0, A=x (Unity UnpackNormal RG-or-AG), mips renormalised
+  smooth -> BC3 grayscale in RGBA (smoothness = 1 - baked roughness), linear
+  emit   -> BC7 sRGB (only written when any texel is lit)
+etcpak takes RGBA input (verified with texture2ddecoder round-trips).
+Padding (2026-10-18, default on, TFA_NO_PAD=1 disables): every baked tile is filled outside its UV islands by a
+push-pull pyramid from the island texels (coverage = any pass differs from Blender's bake background: black colour/
+roughness/emission/alpha, flat normal). Unpadded bakes carried
+black albedo + roughness 0 (= smoothness 1, a mirror) + junk normals around every island; bilinear filtering and the mips
+pulled that into every seam -> jagged bright edges at the lips/chin and cracked streaks along the vulva slit (m19c).
+Quality (opt-in, 2026-10-19 body fidelity): TFA_NORMAL_BC5=1 writes normal maps as BC5 (TextureFormat 27, R = x,
+G = y: the 6-bit/4-level G channel of DXT5nm banded the relief), TFA_COLOR_BC7=1 keeps BC7 colour under
+TFA_OFFICIAL_FORMATS.
+Budget (opt-in): TFA_CAPS="MainTex=2048,BumpMap=1024,*=2048" caps sizes (drops top mips), TFA_OFFICIAL_FORMATS=1 =
+DXT1 opaque colour/smoothness/spec, DXT5 alpha colour/normals/transparency (formats of the official characters),
+TFA_NORMAL_DX=1 writes the normal map Y flipped (DirectX convention of the official maps), TFA_SCALAR_BC4=1 writes SmoothnessMap / SpecGlossMap /
+MetallicGlossMap as BC4 (TextureFormat 26, R only, 4 bpp; Unified reads .r - texture plan 2026-10-25), TFA_CONST_4X4=1 stores a
+constant map (every channel's range <= 2) as its 4x4 mip only, TFA_EMIT_TO_ALBEDO=<gain> adds the emission bake
+to the colour (linear; Unified has no emission slot: LEDs, eye glow).
+Alpha (2026-10-18, TFA_NO_ALPHA_FIX=1 disables): colour dilated under texels below the cutoff (TFA_ALPHA_CUTOFF, default
+0.5; hair 0.27) and coverage-preserving alpha mips in _MainTex.a and _TransparencyMap (REVIEW D19 aliased lashes/brows).
+"""
+import json, os, sys
+import numpy as np
+from PIL import Image
+import etcpak
+
+Image.MAX_IMAGE_PIXELS = None
+
+
+def load(path, mode):
+    return np.asarray(Image.open(path).convert(mode))
+
+
+def push_pull(img, mask):
+    """fill texels where mask is False from the covered ones (pyramid average, smooth extrapolation)."""
+    levels = []
+    cur, m = img.astype(np.float32), mask.astype(np.float32)
+    if cur.ndim == 2:
+        cur = cur[..., None]
+    while min(cur.shape[:2]) > 1:
+        levels.append((cur, m))
+        h, w = cur.shape[0] // 2 * 2, cur.shape[1] // 2 * 2
+        cw = (cur[:h, :w] * m[:h, :w, None]).reshape(h // 2, 2, w // 2, 2, -1).sum((1, 3))
+        mw = m[:h, :w].reshape(h // 2, 2, w // 2, 2).sum((1, 3))
+        cur = cw / np.maximum(mw, 1e-8)[..., None]; m = (mw > 0).astype(np.float32)
+    for fine, fm in reversed(levels):
+        up = np.repeat(np.repeat(cur, 2, 0), 2, 1)[:fine.shape[0], :fine.shape[1]]
+        if up.shape[:2] != fine.shape[:2]:
+            up = np.pad(up, ((0, fine.shape[0] - up.shape[0]), (0, fine.shape[1] - up.shape[1]), (0, 0)), mode="edge")
+        cur = np.where(fm[..., None] > 0, fine, up)
+    out = np.clip(cur + 0.5, 0, 255).astype(np.uint8)
+    return out[..., 0] if img.ndim == 2 else out
+
+
+_COV = {}
+
+
+def coverage(bake, tag, tile):
+    """island texels of one baked tile. Blender leaves the background black in colour/roughness/emission/alpha bakes
+    and FLAT (128,128,255) in normal bakes, so a texel is covered when any pass differs from that background."""
+    key = (bake, tag, tile)
+    cd = os.environ.get("TFA_COVER_DIR")                          # exact masks from uv_cover_masks.py win
+    if key not in _COV and cd and os.path.isfile(os.path.join(cd, f"{tag}_cover.{tile}.png")):
+        _COV[key] = load(os.path.join(cd, f"{tag}_cover.{tile}.png"), "L") > 127
+    if key not in _COV:
+        cov = None
+        for p, mode, test in (("color", "RGB", lambda a: a.sum(2) > 0), ("rough", "L", lambda a: a > 0),
+                              ("normal", "RGB", lambda a: np.abs(a.astype(np.int16) - [128, 128, 255]).max(2) > 2),
+                              ("emit", "RGB", lambda a: a.sum(2) > 0), ("alpha", "L", lambda a: a > 0)):
+            f = os.path.join(bake, f"{tag}_{p}.{tile}.png")
+            if os.path.isfile(f):
+                c = test(load(f, mode))
+                cov = c if cov is None else (cov | c)
+        _COV[key] = cov
+    return _COV[key]
+
+
+def pad(img, cov):
+    if cov is None or os.environ.get("TFA_NO_PAD") or cov.shape != img.shape[:2] or cov.all() or not cov.any():
+PS D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets> Get-ChildItem "scripts" -Recurse -File -Include *.py | Select-String -Pattern "slots\s*=|slots\.items|slots_json|own_rig\.py" | Select-Object Path, LineNumber, Line
+
+
+Path
+----
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\audit\atlas_padding_check.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\audit\atlas_padding_check.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\audit\clip_gate.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\audit\level_pair_gate.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\audit\texture_plan.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\audit\tex_audit.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\blender\bake_hp_normal_to_game.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\blender\bake_hp_normal_to_game.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\blender\details_inventory_scan.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\ingame_test\fake_harness.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\ingame_test\perf_p0.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\ingame_test\perf_run.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\ingame_test\perf_run.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\ingame_test\perf_run.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\ingame_test\perf_run.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\ingame_test\vanilla_smoke.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\ingame_test\vanilla_smoke.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\ingame_test\vanilla_smoke.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\modding\game_inventory.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\modding\tfa_modcheck.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\modding\tfa_modcheck.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\review\rv_pose.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\sim\sim_collide.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\sim\sim_collide.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\vendor\own\perf_study\scripts\ragdol...
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\vendor\own\perf_study\scripts\sq_tab...
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\vendor\proof\gap_study\integration\c...
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\vendor\proof\gap_study\materials\dum...
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\vendor\proof\gap_study\materials\wet.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\vendor\resume\tester_batches_rig.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\vendor\resume\tester_batches_rig.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\vendor\resume\tester_batches_rig.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\vendor\resume\tester_batches_rig.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\adaptive_density_body.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\adaptive_density_body.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\assemble_own.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\assemble_own.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\assemble_own.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\assemble_own.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\assemble_own.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\assemble_own.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\assemble_own.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\assemble_own.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\atlas_pad.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\atlas_pad.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\bulk_import.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\bulk_import.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\bulk_import.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\check_stage.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\check_stage.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\clip_layer_fit.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\clip_list_diet.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\clip_suitfit_dedup.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\clip_suitfit_dedup.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\clip_suitfit_dedup.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\clip_xslot_hide.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\clip_xslot_visibility.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\corpus_atlas_aggregate.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\corpus_atlas_aggregate.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\corpus_atlas_aggregate.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\corpus_atlas_aggregate.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\corpus_atlas_aggregate.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\corpus_atlas_aggregate.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\corpus_atlas_extract.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\corpus_atlas_extract.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\crosswear_contract.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\crosswear_fit.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\crosswear_lib.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\crosswear_lib.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\crosswear_lib.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\crosswear_survey.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\decide.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\fold_src_atlas.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\game_rig_drivers.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\game_rig_drivers.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\holes_graft_proof.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\holes_graft_proof.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\interaction_inventory.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\make_part_uv.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\make_part_uv.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\make_split_data.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\mask_sdf_alpha.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\mask_sdf_alpha.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\measure_hide.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\merge_hp_normal.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\merge_hp_normal.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\own_body.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\own_clip_fix.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\own_futa.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\own_layers.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\own_layers.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\own_layers.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\own_meshes.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\own_meshes.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\own_meshes.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\own_rig.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\own_rig.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\own_rig.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\own_rig.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\own_rig.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\own_suit.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\own_suit.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\own_suit_v2.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\own_suit_v2.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\own_textures.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\own_textures.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\own_textures.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\own_tex_compose.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\rig_automap.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\skin_passthrough.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\skin_passthrough.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\skin_repair.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\skin_tone_grade.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\skin_tone_grade.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\slider_split.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\suit_alpha_region.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\suit_alpha_region.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\suit_alpha_region.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\tfa_deep.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\tfa_donor_scan.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\tfa_donor_scan.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\tfa_feature_matrix.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\tfa_validate.py
+D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets\scripts\toolkit_setup.py
+
+
+PS D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets> Select-String -Path "scripts\bulk_import.py","scripts\assemble_own.py" -Pattern "slots|own_rig|own_textures" -Context 5,8
+
+  scripts\bulk_import.py:87:EXAMPLE_MODEL = {
+  scripts\bulk_import.py:88:    "_doc": "per-model names and config files (00b P3). Configs are authored by the AI stag
+e CFG from the templates.",
+  scripts\bulk_import.py:89:    "stem": "<stem>", "display_name": "<Model>", "armature": "<Arm>",
+  scripts\bulk_import.py:90:    "source_blend": _tfa_p("D:/TFA/tfa-character-import-toolsets_v1.2/tfa-character-import-
+toolsets/_data/models/<Model>.blend"), "build_dir": _tfa_p("D:/TFA/tfa-character-import-toolsets_v1.2/tfa-character-imp
+ort-toolsets/_work/models/builds/<model>_build"),
+  scripts\bulk_import.py:91:    "body_object": "BAKED_<Model>_Nude_Body", "futa": "none | variant | asset", "futa_objec
+t": "BAKED_<Model>_Nude_Body_Futa",
+> scripts\bulk_import.py:92:    "futa_keys_object": "<Model>_Nude_Body_Futa", "suit": False, "atlas_slots": {"1001": [0
+, 0], "1002": [1, 0], "1003": [0, 1]},
+  scripts\bulk_import.py:93:    "skin_props": {"<Arm>:<props bone>": {"<mask switch>": False}},
+  scripts\bulk_import.py:94:    "shape_key_objects": ["<Model>_Nude_Body"],
+  scripts\bulk_import.py:95:    "signoff": {"adult": None, "licence": None, "by": None, "date": None},
+  scripts\bulk_import.py:96:    "_doc_benchmark": "only for benchmark models: the shipped character made from this sour
+ce (never overwritten; our stem "
+  scripts\bulk_import.py:97:                      "must differ, e.g. <name>_bench)",
+  scripts\bulk_import.py:98:    "benchmark": {"shipped": _tfa_p("D:/xz/True_Facials/TrueFacials_Pro/TrueFacials_Pro_0.5
+991/Mods/Characters/<name>.tfa"), "shipped_name": "<name>"},
+  scripts\bulk_import.py:99:    "configs": {"stage2": "stage2.json", "body": "body_cfg.json", "assemble": "assemble_cfg
+.json",
+  scripts\bulk_import.py:100:                "face_profile": "face_rig_profile.json", "presets": "outfit_presets.json",
+ "bake_jobs": "bake_jobs.txt",
+  scripts\bulk_import.py:296:        missing = [k for k in roles if k not in a]
+  scripts\bulk_import.py:297:        lower = [f"{k}: {a[k]['w']}x{a[k]['h']} < {b[k]['w']}x{b[k]['h']}" for k in roles
+  scripts\bulk_import.py:298:                 if k in a and a[k]["w"] * a[k]["h"] < b[k]["w"] * b[k]["h"]]
+  scripts\bulk_import.py:299:        blur = [f"{k}: {a[k].get('hf_ratio')} < {th['min_detail_ratio']} x {b[k].get('hf_r
+atio')}" for k in roles
+  scripts\bulk_import.py:300:                if k in a and a[k].get("hf_ratio") and b[k].get("hf_ratio") and a[k]["hf_r
+atio"] < th["min_detail_ratio"] * b[k]["hf_ratio"]]
+> scripts\bulk_import.py:301:        dslots = set(b.get("detail_slots") or []) - set(a.get("detail_slots") or [])
+  scripts\bulk_import.py:302:        out += [{"check": "texture roles of the pair missing in ours", "value": missing, "
+count": len(missing), "limit": 0, "pass": not missing},
+  scripts\bulk_import.py:303:                {"check": "texture resolution lower than the pair", "value": lower, "count
+": len(lower), "limit": 0, "pass": not lower},
+  scripts\bulk_import.py:304:                {"check": "measured detail (hf_ratio) below the pair", "value": blur, "cou
+nt": len(blur), "limit": 0, "pass": not blur},
+> scripts\bulk_import.py:305:                {"check": "detail-map slots of the pair missing in ours", "value": sorted(
+dslots), "count": len(dslots), "limit": 0, "pass": not dslots}]
+  scripts\bulk_import.py:306:    else:
+  scripts\bulk_import.py:307:        out.append({"check": "quality dumps present (tfa_shipped_lib.py ours + pair)", "va
+lue": [qo, qp], "pass": False, "limit": "exist"})
+  scripts\bulk_import.py:308:    ab = os.path.join(os.path.dirname(path), "ingame")          # S17 batches of a benchma
+rk model shoot ours AND the pair
+  scripts\bulk_import.py:309:    shots = sorted(glob.glob(os.path.join(ab, "**", "shot_*.png"), recursive=True))
+  scripts\bulk_import.py:310:    out.append({"check": "in-game A/B shots ours vs pair (look review = AI task)", "value"
+: len(shots), "pass": bool(shots), "limit": ">0"})
+  scripts\bulk_import.py:311:    return out
+  scripts\bulk_import.py:312:
+  scripts\bulk_import.py:313:
+  scripts\bulk_import.py:446:         {"op": "baked_objects", "manifest": os.path.join(ex, "manifest.json"), "out": os.
+path.join(O, "baked_objects.txt")},
+  scripts\bulk_import.py:447:         {"op": "frames", "blend": s2, "out": os.path.join(O, "frames"), "uv": uv, "object
+s": os.path.join(O, "baked_objects.txt")},
+  scripts\bulk_import.py:448:         bl(cfg, s2, "blender/export_shape_keys.py", s2r, os.path.join(ex, "keys"),
+  scripts\bulk_import.py:449:            "--cfg=" + str(mfile(m, "stage2")), *m.get("shape_key_objects", []))], "S2")
+  scripts\bulk_import.py:450:    add("S3", "AUTO", None, ["S2"], [os.path.join(ex, "manifest.json")], [os.path.join(O,
+"skeleton.json")],
+> scripts\bulk_import.py:451:        [py(cfg, "own_rig.py", os.path.join(ex, "manifest.json"), s2r, rigmap,
+  scripts\bulk_import.py:452:            os.path.join(ex, m["body_object"] + ".npz"), O)], "S3 (00b A1-A3)")
+  scripts\bulk_import.py:453:    recipes = os.path.join(m["_dir"], "face_pose_recipes.json")
+  scripts\bulk_import.py:454:    add("S4", "AUTO", "blender", ["S3"], [mfile(m, "face_profile")], [os.path.join(O, "fac
+e_pose_sim.json")],
+  scripts\bulk_import.py:455:        [py(cfg, "make_face_recipes.py", os.path.join(ex, "manifest.json"), mfile(m, "face
+_profile"), recipes),
+  scripts\bulk_import.py:456:         {"op": "write", "path": os.path.join(O, "head_report_native.json"), "text": '{"he
+ad_translation": [0, 0, 0]}'},
+  scripts\bulk_import.py:457:         bl(cfg, s2, "blender/author_face_pose.py", recipes, s2r,
+  scripts\bulk_import.py:458:            os.path.join(O, "head_report_native.json"), os.path.join(O, "face_pose_sim.jso
+n"))], "S4 (AI look review later)")
+  scripts\bulk_import.py:459:    add("S5", "AUTO", None, ["S3"], [mfile(m, "body")], [os.path.join(O, "body_mesh.npz"),
+ os.path.join(O, "holes_geometry.json")],
+  scripts\bulk_import.py:475:             bl(cfg, s2, "blender/bake_material_maps.py", "--inputs=Metallic,Coat Weight",
+ bk, "4096", uv, "body", m["body_object"])]
+  scripts\bulk_import.py:476:    if futa == "variant":
+  scripts\bulk_import.py:477:        cmds7.append(bl(cfg, s2, "blender/bake_material_maps.py", props, bk, "4096", uv, "
+skinfuta", m["futa_object"]))
+  scripts\bulk_import.py:478:    cmds7.append({"op": "bake_jobs", "blend": s2, "jobs": mfile(m, "bake_jobs"), "bake": b
+k, "uv": uv})
+  scripts\bulk_import.py:479:    add("S7", "AUTO", "blender", ["S2", "CFG"], [mfile(m, "bake_jobs")], [bk], cmds7, "S7"
+)
+> scripts\bulk_import.py:480:    slots = json.dumps(m.get("atlas_slots", {}))
+  scripts\bulk_import.py:481:    extra = '[["skinfuta",1003,1,1]]' if futa == "variant" else json.dumps([[tex_tag, 1001
+, 1, 1]]) if futa == "asset" else "[]"
+  scripts\bulk_import.py:482:    add("S8", "AUTO", None, ["S7"] + (["S6"] if futa in ("variant", "asset") else []), [bk
+], [tex],
+> scripts\bulk_import.py:483:        [py(cfg, "own_textures.py", "atlas", bk, "skin", slots, "8192", tex, m["display_na
+me"] + "_Skin", extra),
+> scripts\bulk_import.py:484:         py(cfg, "own_textures.py", "atlas", bk, "body", slots, "8192", tex, m["display_na
+me"] + "_Body"),
+  scripts\bulk_import.py:485:         {"op": "tex_each", "bake": bk, "tex": tex, "skip": ["skin", "body", "skinfuta", t
+ex_tag or ""]}], "S8")
+  scripts\bulk_import.py:486:    if m.get("suit"):
+  scripts\bulk_import.py:487:        add("S9", "AUTO", None, ["S5", "S7"], [mfile(m, "body")], [os.path.join(O, "suit_s
+hell.npz")],
+  scripts\bulk_import.py:488:            [py(cfg, "own_suit_v2.py", mfile(m, "body"), O, "body", "skin", "--bake", bk)]
+, "S9 (AI review of the shell)")
+  scripts\bulk_import.py:489:    deps13 = ["S4", "S5", "S8"] + (["S9"] if m.get("suit") else []) + (["S6"] if futa in (
+"variant", "asset") else [])
+  scripts\bulk_import.py:490:    tfa = os.path.join(B, m["stem"] + ".tfa")
+  scripts\bulk_import.py:491:    add("S13", "AUTO", None, deps13, [mfile(m, "assemble")], [tfa, os.path.join(O, "assemb
+le_report.json")],
+  scripts\bulk_import.py:492:        [{"op": "assemble", "cmd": py(cfg, "assemble_own.py", mfile(m, "assemble")), "tfa"
+: tfa,
+  scripts\bulk_import.py:563:            tag = os.path.basename(f).rsplit("_color.", 1)[0]
+  scripts\bulk_import.py:564:            if tag not in step["skip"]:
+  scripts\bulk_import.py:565:                tags[tag] += 1
+  scripts\bulk_import.py:566:        if not tags:
+  scripts\bulk_import.py:567:            return [], "(expanded at run time: one texture job per bake tag)"
+> scripts\bulk_import.py:568:        cmds = [py(cfg, "own_textures.py", "single", step["bake"], t, step["tex"]) if n ==
+ 1 else
+> scripts\bulk_import.py:569:                py(cfg, "own_textures.py", "atlas", step["bake"], t, "auto", "4096", step[
+"tex"]) for t, n in sorted(tags.items())]
+  scripts\bulk_import.py:570:        return cmds, f"{len(cmds)} texture jobs"
+  scripts\bulk_import.py:571:    if op == "assemble":
+  scripts\bulk_import.py:572:        return [step["cmd"]], f"then prove {step['tfa']} changed (mtime) and copy it to {s
+tep['keep']}"
+  scripts\bulk_import.py:573:    if op == "install":
+  scripts\bulk_import.py:574:        if execute:
+  scripts\bulk_import.py:575:            if not cfg.get("install"):
+  scripts\bulk_import.py:576:                return [], "install disabled (bulk.json install false)"
+  scripts\bulk_import.py:577:            os.makedirs(step["backup"], exist_ok=True)
+  scripts\assemble_own.py:82:# skin repair (own/skin_fix, references/32-skinning-repair.md): no-op without cfg "skin_re
+pair_rules"
+  scripts\assemble_own.py:83:from skin_repair import SkinRepairHook
+  scripts\assemble_own.py:84:SR = SkinRepairHook(CFG, os.path.join(OWN, "skeleton.json"))
+  scripts\assemble_own.py:85:SR.body(body, REPORT_FUTA.get("futa_vertices", 0))                 # before BONES = list(b
+ody["BONES"])
+  scripts\assemble_own.py:86:# budgeted collision proxies (cfg proxy_budget, absent = old behaviour; scripts/proxy_budg
+et.py, perf: own/perf_study/cost_model.md §3.1):
+> scripts\assemble_own.py:87:# the game re-cooks the proxy of EVERY AdvancedCollider every frame (hidden slots too) ->
+triangles of all proxies = frame time
+  scripts\assemble_own.py:88:PBUD = CFG.get("proxy_budget")
+  scripts\assemble_own.py:89:PB_NO_COLLIDER = []                                                # items that got no Adv
+ancedCollider (proxy_budget.no_collider_if_empty)
+> scripts\assemble_own.py:90:PB_SLOTS = {}                                                      # collider slot -> {"tr
+is", "verts", "display_verts"} (REPORT proxy_budget)
+  scripts\assemble_own.py:91:if PBUD:
+  scripts\assemble_own.py:92:    import proxy_budget as PB
+  scripts\assemble_own.py:93:    PB.PER_SUB["on"] = bool(PBUD.get("per_submesh"))                 # perf plan D1 (a): o
+ne proxy submesh per display submesh carrying the display's Material objects (wetness / paint contract)
+  scripts\assemble_own.py:94:PB_WET = {}                                                        # slot -> per-submesh a
+rea report of the proxy (REPORT proxy_wetness)
+  scripts\assemble_own.py:95:
+  scripts\assemble_own.py:96:
+  scripts\assemble_own.py:97:def proxy_subs(cm):
+  scripts\assemble_own.py:98:    """triangle arrays of a proxy mesh dict: one per display submesh (PER_SUB) or the sing
+le legacy array"""
+  scripts\assemble_own.py:431:            if not len(_used):
+  scripts\assemble_own.py:432:                _used = np.zeros(1, np.int64)
+  scripts\assemble_own.py:433:            TRIM_STATS["meshes"] += 1; TRIM_STATS["bones_before"] += int(len(_full)); TRI
+M_STATS["bones_after"] += int(len(_used))
+  scripts\assemble_own.py:434:            if len(_used) < len(_full):
+  scripts\assemble_own.py:435:                _remap = np.zeros(len(_full), np.int64); _remap[_used] = np.arange(len(_u
+sed))
+> scripts\assemble_own.py:436:                _bi2 = np.where(_on, _remap[_bi], 0).astype(_bi.dtype)             # weig
+ht-0 slots point at bone 0 (always a valid index)
+  scripts\assemble_own.py:437:                assert (_used[_bi2[_on]] == _bi[_on]).all() and np.array_equal(_full[_use
+d][_bi2[_on]], _full[_bi[_on]]), name      # same bone AND same bind pose for every weighted influence
+  scripts\assemble_own.py:438:                BI, bind, _keep = _bi2, _full[_used], (_used, int(len(_full)))
+  scripts\assemble_own.py:439:            else:
+  scripts\assemble_own.py:440:                TRIM_STATS["kept_full"].append(name)
+  scripts\assemble_own.py:441:    pid = w.reserve("Mesh")
+  scripts\assemble_own.py:442:    if _keep is not None:
+  scripts\assemble_own.py:443:        MESH_KEEP[pid] = _keep
+  scripts\assemble_own.py:444:    t = build_mesh(w.default("Mesh"), name, V, N, TAN, COL, uvs, subs, BI, BW, BIND if bi
+nd is None else bind, shapes)
+  scripts\assemble_own.py:658:TEXCACHE = {}
+  scripts\assemble_own.py:659:
+  scripts\assemble_own.py:660:
+  scripts\assemble_own.py:661:def _tiny_transparency(name):
+  scripts\assemble_own.py:662:    """cfg tiny_transparency_opaque (absent = old behaviour): a <prefix>_TransparencyMap
+of <= 8 px per side is the texture
+> scripts\assemble_own.py:663:    baker's 'constant map as 4x4' shortcut (own_textures TFA_CONST_4X4 / TFA_CAPS Transpa
+rencyMap=4). It is only right for a
+  scripts\assemble_own.py:664:    constant 255 map; a 4x4 box reduction of a COVERAGE mask (shared set Shion_BodyDefaul
+tShared: alpha 0.3 inside the islands
+  scripts\assemble_own.py:665:    only) gives alpha 0.4-0.66 at every texel -> Unified dithers the whole item (screen-d
+oor stipple, 2026-10-25 tester S2: shoes,
+  scripts\assemble_own.py:666:    jacket, horns, teeth, straps). Shipped opaque materials bind NO _TransparencyMap (tif
+a Boots: None), so skip it."""
+  scripts\assemble_own.py:667:    if not CFG.get("tiny_transparency_opaque") or not name.endswith("_TransparencyMap"):
+  scripts\assemble_own.py:668:        return False
+  scripts\assemble_own.py:669:    try:
+  scripts\assemble_own.py:670:        m_ = json.load(open(tex_file(name, ".json")))
+  scripts\assemble_own.py:671:    except Exception:
+  scripts\assemble_own.py:1133:            P.node(pe_, active=False)
+  scripts\assemble_own.py:1134:            sme = smr(pe_, mpe, [me_] * len(subs_e), ze["V"], root="DEF-Hips", bones_tr=
+[bone_tr(b) for b in bne])
+  scripts\assemble_own.py:1135:            LAYER_OBJS[en_] = {"smr": sme, "endo": True, "hide": [], "V": ze["V"], "z":
+ze, "subs": subs_e, "bn": bne, "mats": [me_] * len(subs_e),
+  scripts\assemble_own.py:1136:                               "bones": [bone_tr(b) for b in bne]}
+  scripts\assemble_own.py:1137:
+> scripts\assemble_own.py:1138:# =============================================================================== outfit
+ slots (her presets -> Customize_<Slot>)
+  scripts\assemble_own.py:1139:OUTFIT = None
+  scripts\assemble_own.py:1140:if CFG.get("outfits"):
+  scripts\assemble_own.py:1141:    from own_outfit_items import plan_outfits, hide_list, MATERIAL_CLASS, TIGHT
+  scripts\assemble_own.py:1142:    OUTFIT = plan_outfits(CFG["outfit_presets"], os.path.join(OWN, "outfit_switches.json
+"), CFG.get("extras", []))
+  scripts\assemble_own.py:1143:    if SS:
+  scripts\assemble_own.py:1144:        SS.finish_plan(OUTFIT)                                       # key ownership per
+ new slot + m_Enabled AND rules
+  scripts\assemble_own.py:1145:    CF.apply_plan(OUTFIT)                                            # clip-fix Mask_* w
+eights per option (no-op when off)
+  scripts\assemble_own.py:1146:    if CFG.get("strip_safe_sliders", True):    # a reported defects last step = full hai
+r
+  scripts\assemble_own.py:1147:        _OFF = ("Off", "Bare", "Nude", "None")
+> scripts\assemble_own.py:1148:        for _sl in OUTFIT["slots"]:
+  scripts\assemble_own.py:1149:            _o = _sl["options"]
+  scripts\assemble_own.py:1150:            if _sl["slot"] == "Outfit" and CFG.get("outfit_order"):
+  scripts\assemble_own.py:1151:                _ord = CFG["outfit_order"]
+  scripts\assemble_own.py:1152:                _o.sort(key=lambda o: _ord.index(o["name"]) if o["name"] in _ord else le
+n(_ord) - 1.5)   # option dicts carry their own data (visible, body_keys)
+  scripts\assemble_own.py:1153:            _last = CFG.get("slot_last", {}).get(_sl["slot"])
+  scripts\assemble_own.py:1154:            if _last is None and _o[-1]["name"] not in _OFF:
+  scripts\assemble_own.py:1155:                _last = next((o["name"] for o in _o if o["name"] in _OFF), None)
+  scripts\assemble_own.py:1156:            if _last and _o[-1]["name"] != _last:
+  scripts\assemble_own.py:1157:                _src = next((o for o in _o if o["name"] == _last), None)
+  scripts\assemble_own.py:1158:                if _src is not None:
+  scripts\assemble_own.py:1159:                    _o.append(_copy.deepcopy(_src))
+> scripts\assemble_own.py:1160:        REPORT["strip_safe_sliders"] = {s_["slot"]: [o["name"] for o in s_["options"]] f
+or s_ in OUTFIT["slots"]}
+  scripts\assemble_own.py:1161:    OUT_ITEMS = {}                                                   # model object -> {
+item, smr, mesh, mats, V, N, bones, hide}
+  scripts\assemble_own.py:1162:    HIDDEN0 = set()
+  scripts\assemble_own.py:1163:    if PROBE_STUB:                                                   # objects of a slot
+ that are not visible in the slot's first (default) option
+  scripts\assemble_own.py:1164:        _vis0, _allo = set(), set()
+> scripts\assemble_own.py:1165:        for _sl in OUTFIT["slots"]:
+  scripts\assemble_own.py:1166:            _allo |= set(_sl["objects"]); _vis0 |= set(_sl["options"][0]["visible"])
+  scripts\assemble_own.py:1167:        HIDDEN0 = _allo - _vis0
+  scripts\assemble_own.py:1168:    for obj, info in OUTFIT["objects"].items():
+  scripts\assemble_own.py:1169:        if info["extra"]:                                            # already built as
+an extra (hair strands, horns, nails …)
+  scripts\assemble_own.py:1170:            OUT_ITEMS[obj] = {"item": info["extra"], "extra": True}
+  scripts\assemble_own.py:1171:            continue
+  scripts\assemble_own.py:1172:        bobj = "BAKED_" + obj
+  scripts\assemble_own.py:1173:        if bobj not in MB.man["objects"]:
+  scripts\assemble_own.py:1206:        smr_pid = smr(path, mp_disp, mats, m["V"], root="DEF-Hips", bones_tr=[bone_tr(b)
+ for b in bnames], weights=w_disp)
+  scripts\assemble_own.py:1207:        hide = [] if CF.on else (hide_list(V, N, m["V"], m["N"], TIGHT[obj]).tolist() if
+ obj in TIGHT else [])
+  scripts\assemble_own.py:1208:        OUT_ITEMS[obj] = {"item": info["item"], "smr": smr_pid, "mesh": mp, "mats": mats
+, "V": m["V"], "bones": [bone_tr(b) for b in bnames],
+  scripts\assemble_own.py:1209:                          "hide": hide, "extra": False, "m": m}
+  scripts\assemble_own.py:1210:        REPORT["objects"][f"{CFG['display_name']}_{info['item']}"].update({"source": bob
+j, "hidden_body_vertices": len(hide), "kind": kind})
+> scripts\assemble_own.py:1211:    REPORT["outfit_slots"] = {s["slot"]: [o["name"] for o in s["options"]] for s in OUTF
+IT["slots"]}
+  scripts\assemble_own.py:1212:
+  scripts\assemble_own.py:1213:# =============================================================================== data o
+bjects
+  scripts\assemble_own.py:1214:order = ["Breasts", "Mouth", "Ass", "Throat"]                   # bodyDeformerStartIdLis
+t order (game contract)
+  scripts\assemble_own.py:1215:starts, full = [], []
+  scripts\assemble_own.py:1216:for part in order:
+  scripts\assemble_own.py:1217:    starts.append(len(full)); full += patch_ids[part].tolist()
+  scripts\assemble_own.py:1218:GDO = w.reserve("Girl_DataObject")
+  scripts\assemble_own.py:1219:gdo = w.default("Girl_DataObject")
+  scripts\assemble_own.py:1247:        assert max(reduced_to_full) < len(V), "MAP_IDS beyond Body_ (futa piece missing?
+)"
+  scripts\assemble_own.py:1248:    else:
+  scripts\assemble_own.py:1249:        nearest = _KD(V[:n_disp]).query(cb["V"])[1]             # display Body_ vertex f
+or every collision vertex
+  scripts\assemble_own.py:1250:        reduced_to_full = nearest.astype(int).tolist()
+  scripts\assemble_own.py:1251:    COL_V = cb["V"]
+> scripts\assemble_own.py:1252:    PB_SLOTS["Body"] = {"tris": int(len(cb["TRI0"]) + len(cb["TRI1"])), "verts": int(len
+(cb["V"])), "display_verts": int(len(V))}
+  scripts\assemble_own.py:1253:    REPORT["collision_body"] = {"vertices": int(len(cb["V"])), "triangles": int(len(cb["
+TRI0"]) + len(cb["TRI1"])),
+  scripts\assemble_own.py:1254:                                "max_map_dist_mm": round(float(np.linalg.norm(V[np.asarr
+ay(reduced_to_full)] - cb["V"], axis=1).max() * 1000), 4),
+  scripts\assemble_own.py:1255:                                "exact_map": "MAP_IDS" in cb}
+  scripts\assemble_own.py:1256:else:
+  scripts\assemble_own.py:1257:    MESH_COL = mesh_object(f"{CFG['display_name']}_Collision_Body", V, N, TAN, COL, uvs,
+ [TRI0, TRI1], body["BI"], body["BW"], [])
+  scripts\assemble_own.py:1258:    reduced_to_full = list(range(len(V)))
+  scripts\assemble_own.py:1259:    COL_V = V
+  scripts\assemble_own.py:1260:ACDO = w.reserve("AdvancedCollider_DataObject")
+  scripts\assemble_own.py:1269:    P.node(f"{R}/Colliders/{name}")
+  scripts\assemble_own.py:1270:    ac = reserve_script(f"{R}/Colliders/{name}", "AdvancedCollider")
+  scripts\assemble_own.py:1271:    P.node(f"{R}/Colliders/{name}/{name}")
+  scripts\assemble_own.py:1272:    if proxy:                                                       # budgeted proxy (sh
+ared by the colour variants of one geometry)
+  scripts\assemble_own.py:1273:        col = smr(f"{R}/Colliders/{name}/{name}", proxy["mesh"], mats[:proxy.get("nsub",
+ 1)], proxy["V"], bones_tr=bones)
+> scripts\assemble_own.py:1274:        PB_SLOTS[name] = {k_: proxy[k_] for k_ in ("tris", "verts", "display_verts")}
+  scripts\assemble_own.py:1275:    else:
+  scripts\assemble_own.py:1276:        col = smr(f"{R}/Colliders/{name}/{name}", mesh_pid, mats, Vv, bones_tr=bones)
+  scripts\assemble_own.py:1277:    dob = w.reserve("AdvancedCollider_DataObject")
+  scripts\assemble_own.py:1278:    dd = w.default("AdvancedCollider_DataObject")
+  scripts\assemble_own.py:1279:    if cs:
+  scripts\assemble_own.py:1280:        lst = cs["m_bodyVertPushList"]
+  scripts\assemble_own.py:1281:    else:
+  scripts\assemble_own.py:1282:        lst = xw_push(hide)                                         # own ids -> standar
+d ids when the contract is on
+  scripts\assemble_own.py:1291:    return ac
+  scripts\assemble_own.py:1292:
+  scripts\assemble_own.py:1293:
+  scripts\assemble_own.py:1294:SUIT_PROXY = {}
+  scripts\assemble_own.py:1295:if SUIT and SUITV3 and PBUD:
+> scripts\assemble_own.py:1296:    # the v3 suit collider used the DISPLAY mesh (80 k vertices, 144 k triangles) for th
+e main shell and every variant: 7 slots x 130 k triangles
+  scripts\assemble_own.py:1297:    # re-cooked every frame (m21d: 945 k of 1.04 M proxy triangles). Clip-fix proxy (CF.
+collision_mesh("Bodysuit"/"BodysuitThin")) when its data
+  scripts\assemble_own.py:1298:    # has one, else the cfg budget; colour variants of one geometry share ONE proxy mesh
+ (3 x main, 4 x thin). The suit sits 0.4-2.5 mm above the
+  scripts\assemble_own.py:1299:    # skin and the Body proxy is right under it: hand raycasts / fluids / ragdoll do not
+ need a detailed suit proxy.
+  scripts\assemble_own.py:1300:    def _suit_proxy(key, z, tris):
+  scripts\assemble_own.py:1301:        cm_ = CF.collision_mesh(key, z) if (CF.on and not PBUD.get("qem_all")) else None
+  scripts\assemble_own.py:1302:        if cm_ is None and PBUD:
+  scripts\assemble_own.py:1303:            _subs = [z[k_] for k_ in ("SUB0", "SUB1") if k_ in z and len(z[k_])]
+  scripts\assemble_own.py:1304:            if "PROXY_EXCLUDE" in z:                                  # garment-fit m21f
+3: the bare region of the alpha cut-out has no proxy (paint / wetness / fluid land on the skin there)
+  scripts\assemble_own.py:1316:            PB_WET[key] = cm_["SUBREP"]
+  scripts\assemble_own.py:1317:        return {"mesh": mesh_object(f"{CFG['display_name']}_Collision_{key}", cm_["V"],
+cm_["N"], cm_["TAN"], None,
+  scripts\assemble_own.py:1318:                                    {0: cm_["UV0"], 1: cm_["UV1"], 2: cm_["UV2"]}, proxy
+_subs(cm_), cm_["BI"], cm_["BW"], [],
+  scripts\assemble_own.py:1319:                                    bind=np.stack([np.linalg.inv(W_rest[b]) for b in bn_
+])),
+  scripts\assemble_own.py:1320:                "V": cm_["V"], "tris": int(len(cm_["TRI"])), "verts": int(len(cm_["V"]))
+, "display_verts": int(len(z["V"])), "nsub": len(proxy_subs(cm_))}
+> scripts\assemble_own.py:1321:    _pbs = (PBUD or {}).get("slots", {})
+  scripts\assemble_own.py:1322:    SUIT_PROXY["main"] = _suit_proxy("Bodysuit", sz, _pbs.get("Bodysuit"))
+  scripts\assemble_own.py:1323:    if THIN is not None:
+  scripts\assemble_own.py:1324:        SUIT_PROXY["thin"] = _suit_proxy("BodysuitThin", THIN["sz"], _pbs.get("BodysuitT
+hin"))
+  scripts\assemble_own.py:1325:if SUIT and SUITV3:
+  scripts\assemble_own.py:1326:    # cfg suit_push_delta {"sets": "<npz: NEAR, BARE, BAND_PUSH_I, BAND_PUSH_RATIO>", "m
+d5": "<prefix>"} (garment-fit m21f3 alpha cut-out, explicit sets in own Body_ ids): the MAIN suit's push list comes fro
+m the
+  scripts\assemble_own.py:1327:    # clip data (push_lists.json["Bodysuit"], solved on the shells WITH the bare region
+hidden / pushed), not from the shell HIDE / PUSH arrays: drop EVERY entry of a NEAR vertex (bare region + hide border),
+  scripts\assemble_own.py:1328:    # add the D21 band pushes (visibility 1.0). The thin looks keep using their shell ar
+rays (same rule inside). Counts -> REPORT suit_push_delta.
+  scripts\assemble_own.py:1329:    _spd = CFG.get("suit_push_delta")
+  scripts\assemble_own.py:1381:                          {0: _pl["UV0"], 1: _pl["UV1"], 2: _pl["UV2"]}, proxy_subs(_pl)
+, _pl["BI"], _pl["BW"], [],
+  scripts\assemble_own.py:1382:                          bind=np.stack([np.linalg.inv(W_rest[b]) for b in L_["bn"]]))
+  scripts\assemble_own.py:1383:        col = smr(f"{R}/Colliders/{name}/{name}", _pm, L_["mats"][:len(proxy_subs(_pl))]
+, _pl["V"], bones_tr=L_["bones"])
+  scripts\assemble_own.py:1384:        if _pl.get("SUBREP"):
+  scripts\assemble_own.py:1385:            PB_WET[name] = _pl["SUBREP"]
+> scripts\assemble_own.py:1386:        PB_SLOTS[name] = {"tris": int(len(_pl["TRI"])), "verts": int(len(_pl["V"])), "di
+splay_verts": int(len(L_["V"]))}
+  scripts\assemble_own.py:1387:    else:
+  scripts\assemble_own.py:1388:        col = smr(f"{R}/Colliders/{name}/{name}", L_["mesh"], L_["mats"], L_["V"], bones
+_tr=L_["bones"])
+  scripts\assemble_own.py:1389:    dob = w.reserve("AdvancedCollider_DataObject")
+  scripts\assemble_own.py:1390:    dd = w.default("AdvancedCollider_DataObject")
+  scripts\assemble_own.py:1391:    dd.update({"m_Name": f"Collider_Data_{name}", "m_reducedToFullIds": [], "m_bodyVertP
+ushList": xw_push(L_["hide"])})
+  scripts\assemble_own.py:1392:    w.fill(dob, dd)
+  scripts\assemble_own.py:1393:    fill_script(ac, "AdvancedCollider", {"m_skinRD": pptr(L_["smr"]), "m_skinColRD": ppt
+r(col), "m_data": pptr(dob),
+  scripts\assemble_own.py:1394:                                         "m_pushBody": 1, "m_wrapToBody": 1})
+  scripts\assemble_own.py:1415:            continue
+  scripts\assemble_own.py:1416:        _sb = [np.asarray(s_, np.int64) for s_ in _it["m"]["SUBS"] if len(s_)]
+  scripts\assemble_own.py:1417:        if _sb:
+  scripts\assemble_own.py:1418:            _gi[_it["item"]] = (_it["m"]["V"], _sb)
+  scripts\assemble_own.py:1419:    PB_ITEM_TRIS, PB_GATED = PB.gated_targets(_gi, PBUD["gate_driven"])
+> scripts\assemble_own.py:1420:elif PBUD and PBUD.get("garments_total") and OUTFIT:                # the item slots sha
+re garments_total by display AREA (floor garment_min, cap garment_max)
+  scripts\assemble_own.py:1421:    _pool = {}
+  scripts\assemble_own.py:1422:    for _o, _it in OUT_ITEMS.items():
+  scripts\assemble_own.py:1423:        if _it.get("extra") or (not CF.on and not _it["hide"]) or _pb_no_collider(_o, _i
+t) or PB.slot_target(PBUD, _it["item"]) is not None:
+  scripts\assemble_own.py:1424:            continue
+  scripts\assemble_own.py:1425:        _sb = [np.asarray(s_, np.int64) for s_ in _it["m"]["SUBS"] if len(s_)]
+  scripts\assemble_own.py:1426:        _pool[_it["item"]] = PB.mesh_area(_it["m"]["V"], np.concatenate(_sb, 0)) if _sb
+else 0.0
+  scripts\assemble_own.py:1427:    PB_ITEM_TRIS = PB.allocate(_pool, int(PBUD["garments_total"]), int(PBUD.get("garment
+_min", 40)), int(PBUD.get("garment_max", 400)))
+> scripts\assemble_own.py:1428:FEATURE_AC = []                      # clip fix: colliders of items in non-clothing slot
+s (Robotic_Head): exist, but not clothing
+  scripts\assemble_own.py:1429:AC_ITEMS = set()
+> scripts\assemble_own.py:1430:NON_CLOTHING_SLOTS = ("Hair", "Horns", "HeadLeds")                # the m_nonClothingAni
+ms slots
+> scripts\assemble_own.py:1431:_slot_of = {ob: sl["slot"] for sl in OUTFIT["slots"] for ob in sl["objects"]} if OUTFIT
+else {}
+  scripts\assemble_own.py:1432:if OUTFIT:
+  scripts\assemble_own.py:1433:    for obj, it in OUT_ITEMS.items():
+  scripts\assemble_own.py:1434:        if it.get("extra") or (not CF.on and not it["hide"]):      # clip fix: every ite
+m gets a collider (shipped convention)
+  scripts\assemble_own.py:1435:            continue
+  scripts\assemble_own.py:1436:        if _pb_no_collider(obj, it):
+  scripts\assemble_own.py:1437:            PB_NO_COLLIDER.append(it["item"]); continue
+  scripts\assemble_own.py:1438:        slotp = f"{R}/Colliders/{it['item']}"
+  scripts\assemble_own.py:1439:        P.node(slotp)
+  scripts\assemble_own.py:1446:                cm = PB.proxy_from_mesh(it["m"], it["m"]["SUBS"], int(_tt))
+  scripts\assemble_own.py:1447:            elif cm is None and _tt:
+  scripts\assemble_own.py:1448:                cm = PB.proxy_from_mesh(it["m"], it["m"]["SUBS"], int(_tt))
+  scripts\assemble_own.py:1449:            elif cm is not None and (PB.slot_target(PBUD, it["item"]) or PBUD.get("item_
+cap")):
+  scripts\assemble_own.py:1450:                cm = PB.reduce_proxy(cm, int(PB.slot_target(PBUD, it["item"], PBUD.get("
+item_cap"))))
+> scripts\assemble_own.py:1451:            PB_SLOTS[it["item"]] = ({"tris": int(len(cm["TRI"])), "verts": int(len(cm["V
+"]))} if cm is not None else
+  scripts\assemble_own.py:1452:                                    {"tris": int(sum(len(s_) for s_ in it["m"]["SUBS"]))
+, "verts": int(len(it["V"]))})
+> scripts\assemble_own.py:1453:            PB_SLOTS[it["item"]]["display_verts"] = int(len(it["V"]))
+  scripts\assemble_own.py:1454:        if cm is not None:
+  scripts\assemble_own.py:1455:            colm = mesh_object(f"{CFG['display_name']}_Collision_{it['item']}", cm["V"],
+ cm["N"], cm["TAN"], None,
+  scripts\assemble_own.py:1456:                               {0: cm["UV0"], 1: cm["UV1"], 2: cm["UV2"]}, proxy_subs(cm
+), cm["BI"], cm["BW"], cm["SHAPES"],
+  scripts\assemble_own.py:1457:                               bind=np.stack([np.linalg.inv(W_rest[b]) for b in it["m"][
+"BONES"]]))
+  scripts\assemble_own.py:1458:            col = smr(f"{slotp}/{it['item']}", colm, it["mats"][:len(proxy_subs(cm))], c
+m["V"], bones_tr=it["bones"])
+  scripts\assemble_own.py:1459:            if cm.get("SUBREP"):
+  scripts\assemble_own.py:1460:                PB_WET[it["item"]] = cm["SUBREP"]
+  scripts\assemble_own.py:1461:        else:
+  scripts\assemble_own.py:1525:            if not cdat:
+  scripts\assemble_own.py:1526:                acv.update({"m_pushDistance": -0.018, "m_forceHideList": ["Toe.L:0.05",
+"Toe.R:0.05"]})
+  scripts\assemble_own.py:1527:            REPORT["shoes_collider"] = {"sole_y": round(sole_y, 4), "heel_height_m": rou
+nd(float(W_rest["Foot.L_base"][1, 3] - sole_y), 4)}
+  scripts\assemble_own.py:1528:        fill_script(ac, "AdvancedCollider", acv)
+  scripts\assemble_own.py:1529:        AC_ITEMS.add(obj)
+> scripts\assemble_own.py:1530:        (FEATURE_AC if CF.on and _slot_of.get(obj) in NON_CLOTHING_SLOTS else OUT_AC).ap
+pend(ac)
+  scripts\assemble_own.py:1531:
+  scripts\assemble_own.py:1532:# =============================================================================== helper
+s for anatomy placement
+  scripts\assemble_own.py:1533:Wb = lambda n: W_rest[n]
+  scripts\assemble_own.py:1534:pos = lambda n: W_rest[n][:3, 3]
+  scripts\assemble_own.py:1535:
+  scripts\assemble_own.py:1536:
+  scripts\assemble_own.py:1537:def place(path, M, active=True, layer=0):
+  scripts\assemble_own.py:1538:    return P.node(path, world=M, active=active, layer=layer)
+  scripts\assemble_own.py:1747:        r0 = shaft_radius(a, b); r1 = shaft_radius(b, shaft[min(k + 2, 7)]) if k < 6 els
+e r0 * 0.8
+  scripts\assemble_own.py:1748:        cc_specs[f"penis{k + 1}_CC"] = ("capsule", {"center": v3((0, 0, L / 2)), "axis":
+ 2, "length": L,
+  scripts\assemble_own.py:1749:                                                     "startRadius": r0, "endRadius": r1,
+ "isGlobal": 1})
+  scripts\assemble_own.py:1750:        PENIS_CC.append(f"penis{k + 1}_CC")
+  scripts\assemble_own.py:1751:    REPORT["penis_cloth_colliders"] = {n: {k: round(v, 4) for k, v in cc_specs[n][1].ite
+ms() if k != "center"} for n in PENIS_CC}
+> scripts\assemble_own.py:1752:# hair-only colliders (own_hair_colliders.py, references/23 section 8): children of the
+standard slots (Rig.Init re-parents
+  scripts\assemble_own.py:1753:# the slot with its children), listed only by the hair cloths; the garments keep the tig
+ht standard set
+  scripts\assemble_own.py:1754:if CFG.get("hair_colliders"):
+  scripts\assemble_own.py:1755:    for _hc in json.load(open(CFG["hair_colliders"])).values():
+  scripts\assemble_own.py:1756:        place(f"{R}/ClothColliders/{_hc['path']}", np.array(_hc["transform"]))
+  scripts\assemble_own.py:1757:        cc_specs[_hc["path"]] = ("sphere" if "radius" in _hc["fields"] else "capsule", _
+cpv(_hc["fields"]))
+  scripts\assemble_own.py:1758:    REPORT["hair_colliders"] = len(json.load(open(CFG["hair_colliders"])))
+  scripts\assemble_own.py:1759:CCP = {}
+  scripts\assemble_own.py:1760:for path, (kind, vals) in cc_specs.items():
+  scripts\assemble_own.py:1862:        REPORT.setdefault("patch_bound_pairs", {})[part_] = len(_pairs)
+  scripts\assemble_own.py:1863:    fill_script(rd_, "MagicaRenderDeformer", vals_)
+  scripts\assemble_own.py:1864:REPORT["patch_border_verts"] = {k: int(len(v)) for k, v in patch_border.items()}
+  scripts\assemble_own.py:1865:fill_script(AC_BODY, "AdvancedCollider", {"m_skinRD": pptr(SMR_BODY), "m_skinColRD": ppt
+r(SMR_COL), "m_data": pptr(ACDO)})
+  scripts\assemble_own.py:1866:
+> scripts\assemble_own.py:1867:# =============================================================================== Collid
+ers for the model's other slots
+  scripts\assemble_own.py:1868:SLOT_AC = []
+  scripts\assemble_own.py:1869:for nm, val in EXTRA_SMR.items():
+  scripts\assemble_own.py:1870:    if not isinstance(val, tuple):
+  scripts\assemble_own.py:1871:        continue
+  scripts\assemble_own.py:1872:    smr_pid, mp, mats, Vv, btr, slot = val
+  scripts\assemble_own.py:1873:    P.node(f"{R}/Colliders/{slot}")
+  scripts\assemble_own.py:1874:    ac = reserve_script(f"{R}/Colliders/{slot}", "AdvancedCollider")
+  scripts\assemble_own.py:1875:    P.node(f"{R}/Colliders/{slot}/{slot}")
+  scripts\assemble_own.py:1881:                          {0: _pl["UV0"], 1: _pl["UV1"], 2: _pl["UV2"]}, proxy_subs(_pl)
+, _pl["BI"], _pl["BW"], [],
+  scripts\assemble_own.py:1882:                          bind=np.stack([np.linalg.inv(W_rest[b]) for b in _xm["BONES"]]
+))
+  scripts\assemble_own.py:1883:        col = smr(f"{R}/Colliders/{slot}/{slot}", _pm, mats[:len(proxy_subs(_pl))], _pl[
+"V"], root="DEF-Head", bones_tr=btr)
+  scripts\assemble_own.py:1884:        if _pl.get("SUBREP"):
+  scripts\assemble_own.py:1885:            PB_WET[slot] = _pl["SUBREP"]
+> scripts\assemble_own.py:1886:        PB_SLOTS[slot] = {"tris": int(len(_pl["TRI"])), "verts": int(len(_pl["V"])), "di
+splay_verts": int(len(Vv))}
+  scripts\assemble_own.py:1887:    else:
+  scripts\assemble_own.py:1888:        col = smr(f"{R}/Colliders/{slot}/{slot}", mp, mats, Vv, root="DEF-Head", bones_t
+r=btr)
+  scripts\assemble_own.py:1889:        if PBUD:                                                    # not reduced (no ru
+le for this slot): counted at full size in the report
+> scripts\assemble_own.py:1890:            PB_SLOTS[slot] = {"tris": int(sum(len(s_) for s_ in EXTRA_M[nm][1]["SUBS"]))
+, "verts": int(len(Vv)), "display_verts": int(len(Vv))}
+  scripts\assemble_own.py:1891:    dobj = w.reserve("AdvancedCollider_DataObject")
+  scripts\assemble_own.py:1892:    d = w.default("AdvancedCollider_DataObject"); d.update({"m_Name": f"Collider_Data_{s
+lot}", "m_reducedToFullIds": [], "m_bodyVertPushList": []})
+  scripts\assemble_own.py:1893:    w.fill(dobj, d)
+  scripts\assemble_own.py:1894:    fill_script(ac, "AdvancedCollider", {"m_skinRD": pptr(smr_pid), "m_skinColRD": pptr(
+col), "m_data": pptr(dobj),
+  scripts\assemble_own.py:1895:                                         **({"m_cullAngleCollision": -1.0, "reducePercen
+tage": 40.0} if SHIPT and slot in ("Eyes", "Tongue") else {})})
+  scripts\assemble_own.py:1896:    SLOT_AC.append(ac)
+  scripts\assemble_own.py:1897:# clip fix H: extras without a slot collider (horns, hair strands) get one like tifa's H
+air/Earring colliders (hands and
+  scripts\assemble_own.py:1898:# fluids land on them). cfg "collider_extras" (default: these three when the clip fix is
+ on, else none = old behaviour).
+  scripts\assemble_own.py:1910:        _tt = PB.slot_target(PBUD, nm) or PBUD.get("items_default")
+  scripts\assemble_own.py:1911:        if (PBUD.get("qem_all") or cm is None) and _tt:
+  scripts\assemble_own.py:1912:            cm = PB.proxy_from_mesh(m_, m_["SUBS"], int(_tt))
+  scripts\assemble_own.py:1913:        elif cm is not None and (PB.slot_target(PBUD, nm) or PBUD.get("item_cap")):
+  scripts\assemble_own.py:1914:            cm = PB.reduce_proxy(cm, int(PB.slot_target(PBUD, nm, PBUD.get("item_cap")))
+)
+> scripts\assemble_own.py:1915:        PB_SLOTS[nm] = ({"tris": int(len(cm["TRI"])), "verts": int(len(cm["V"]))} if cm
+is not None else
+  scripts\assemble_own.py:1916:                        {"tris": int(sum(len(s_) for s_ in m_["SUBS"])), "verts": int(le
+n(m_["V"]))})
+> scripts\assemble_own.py:1917:        PB_SLOTS[nm]["display_verts"] = int(len(m_["V"]))
+  scripts\assemble_own.py:1918:    if cm is not None:
+  scripts\assemble_own.py:1919:        colm = mesh_object(f"{CFG['display_name']}_Collision_{nm}", cm["V"], cm["N"], cm
+["TAN"], None,
+  scripts\assemble_own.py:1920:                           {0: cm["UV0"], 1: cm["UV1"], 2: cm["UV2"]}, proxy_subs(cm), c
+m["BI"], cm["BW"], [],
+  scripts\assemble_own.py:1921:                           bind=np.stack([np.linalg.inv(W_rest[b]) for b in m_["BONES"]]
+))
+  scripts\assemble_own.py:1922:        col = smr(f"{R}/Colliders/{nm}/{nm}", colm, mats_[:len(proxy_subs(cm))], cm["V"]
+, root="DEF-Head", bones_tr=btr_)
+  scripts\assemble_own.py:1923:        if cm.get("SUBREP"):
+  scripts\assemble_own.py:1924:            PB_WET[nm] = cm["SUBREP"]
+  scripts\assemble_own.py:1925:    else:
+  scripts\assemble_own.py:1951:        dob_ = w.reserve("AdvancedCollider_DataObject")
+  scripts\assemble_own.py:1952:        d_ = w.default("AdvancedCollider_DataObject"); d_.update({"m_Name": f"Collider_D
+ata_{slot}", "m_reducedToFullIds": [], "m_bodyVertPushList": []})
+  scripts\assemble_own.py:1953:        w.fill(dob_, d_)
+  scripts\assemble_own.py:1954:        fill_script(ac_, "AdvancedCollider", {"m_skinRD": pptr(smr_pid), "m_skinColRD":
+pptr(col_), "m_data": pptr(dob_)})
+  scripts\assemble_own.py:1955:        SLOT_AC.append(ac_)
+> scripts\assemble_own.py:1956:        PB_SLOTS[slot] = {"tris": int(len(pl["TRI"])), "verts": int(len(pl["V"])), "disp
+lay_verts": int(len(m["V"]))}
+  scripts\assemble_own.py:1957:        if pl.get("SUBREP"):
+  scripts\assemble_own.py:1958:            PB_WET[slot] = pl["SUBREP"]
+  scripts\assemble_own.py:1959:        TINY_DONE.append(slot)
+  scripts\assemble_own.py:1960:    for obj_t, it_t in OUT_ITEMS.items():                                # outfit items
+the budget left without a collider (plates, straps, collars)
+  scripts\assemble_own.py:1961:        if it_t.get("extra") or it_t["item"] not in _tn or obj_t in AC_ITEMS or "smr" no
+t in it_t:
+  scripts\assemble_own.py:1962:            continue
+  scripts\assemble_own.py:1963:        _tiny_ac(it_t["item"], it_t["smr"], it_t["m"], it_t["m"]["SUBS"], it_t["mats"],
+it_t["bones"], it_t["m"]["BONES"], "DEF-Hips")
+  scripts\assemble_own.py:1964:    for nm_t, (obj_t, m_t, mp_t, mats_t, btr_t) in EXTRA_M.items():     # extras: Horns,
+ Robotic_Head ...
+> scripts\assemble_own.py:1965:        if nm_t not in _tn or nm_t in TINY_DONE or nm_t in PB_SLOTS or isinstance(EXTRA_
+SMR.get(nm_t), tuple):
+  scripts\assemble_own.py:1966:            continue                                                     # not listed /
+done / already has a budgeted slot collider
+  scripts\assemble_own.py:1967:        _tiny_ac(nm_t, EXTRA_SMR[nm_t], m_t, m_t["SUBS"], mats_t, btr_t, m_t["BONES"], "
+DEF-Head")
+  scripts\assemble_own.py:1968:    for nm_t, L_t in LAYER_OBJS.items():                                 # skin layers w
+ithout a push list: Pubes, the endoskeleton pieces
+> scripts\assemble_own.py:1969:        if nm_t not in _tn or nm_t in TINY_DONE or nm_t in PB_SLOTS or L_t.get("z") is N
+one:
+  scripts\assemble_own.py:1970:            continue
+  scripts\assemble_own.py:1971:        _tiny_ac(nm_t, L_t["smr"], L_t["z"], L_t["subs"], L_t["mats"], L_t["bones"], L_t
+["bn"], "DEF-Hips")
+  scripts\assemble_own.py:1972:    REPORT["tiny_wetness_colliders"] = sorted(TINY_DONE)
+  scripts\assemble_own.py:1973:if STRIPPED_WET:
+  scripts\assemble_own.py:1974:    REPORT["wet_keyword_stripped"] = sorted(set(STRIPPED_WET))
+  scripts\assemble_own.py:1975:if SAC_USED:
+  scripts\assemble_own.py:1976:    REPORT["suit_alpha_cut"] = SAC_USED
+  scripts\assemble_own.py:1977:if BONE_TRIM:
+  scripts\assemble_own.py:1978:    REPORT["bone_trim"] = TRIM_STATS                                # live dict: meshes
+created after this point still count
+  scripts\assemble_own.py:1979:if PBUD:                                                            # numbers of the pro
+xies (every slot is baked every frame, hidden ones too)
+> scripts\assemble_own.py:1980:    REPORT["proxy_budget"] = PB.summarize(PB_SLOTS, PBUD)
+  scripts\assemble_own.py:1981:    REPORT["proxy_budget"]["no_collider"] = sorted(PB_NO_COLLIDER)
+  scripts\assemble_own.py:1982:    if PB_WET:
+  scripts\assemble_own.py:1983:        REPORT["proxy_wetness"] = PB_WET                              # per proxy submes
+h: display area, the proxy's area in the GAME formula (sum max(0.001, tri area)), ratio, wetness tile px of both, ok (r
+atio within 25 % OR equal tile)
+> scripts\assemble_own.py:1984:        REPORT["proxy_wetness_summary"] = {"slots": len(PB_WET), "submeshes": sum(len(v_
+) for v_ in PB_WET.values()),
+  scripts\assemble_own.py:1985:                                           "not_ok": [f"{s_}#{r_['sub']}" for s_, rows_
+in PB_WET.items() for r_ in rows_ if not r_.get("ok", True)]}
+  scripts\assemble_own.py:1986:    if PB_GATED:
+  scripts\assemble_own.py:1987:        REPORT["proxy_budget"]["gate_driven"] = PB_GATED
+  scripts\assemble_own.py:1988:if STUBBED:
+  scripts\assemble_own.py:1989:    REPORT["probe_stub_hidden"] = sorted(STUBBED)                    # measurement build
+: these display meshes are 3-vertex stubs (NOT shippable)
+  scripts\assemble_own.py:1990:    print("proxy budget:", {k_: v_ for k_, v_ in REPORT["proxy_budget"].items() if k_ !=
+ "per_slot" and k_ != "gate"}, flush=True)
+  scripts\assemble_own.py:1991:# =============================================================================== futa h
+idden under crotch-covering garments
+  scripts\assemble_own.py:1992:FUTA_HIDE = bool(CFG.get("futa_hide_by_garments"))
+  scripts\assemble_own.py:2190:if OUTFIT:
+  scripts\assemble_own.py:2191:    body_shape_names = [nm for nm, _ in shapes]
+  scripts\assemble_own.py:2192:    def fcurve(path, vals, attribute="m_IsActive", class_id=1):
+  scripts\assemble_own.py:2193:        return {"curve": curve([keyf(i / 60.0, float(v)) for i, v in enumerate(vals)]),
+"attribute": attribute, "path": path,
+  scripts\assemble_own.py:2194:                "classID": class_id, "script": pptr(0), "flags": 0}
+> scripts\assemble_own.py:2195:    for sl in OUTFIT["slots"]:
+  scripts\assemble_own.py:2196:        opts = sl["options"]; curves_ = []
+  scripts\assemble_own.py:2197:        for obj in sl["objects"]:
+  scripts\assemble_own.py:2198:            it = OUT_ITEMS.get(obj)
+  scripts\assemble_own.py:2199:            if not it:
+  scripts\assemble_own.py:2200:                continue
+  scripts\assemble_own.py:2201:            vals = [1.0 if obj in o["visible"] else 0.0 for o in opts]
+  scripts\assemble_own.py:2202:            curves_.append(fcurve(f"FBX/{it['item']}", vals))
+  scripts\assemble_own.py:2203:            P.nodes[SPATH_FBX(it["item"])].active = bool(vals[0]) if SPATH_FBX(it["item"
+]) in P.nodes else True
+> scripts\assemble_own.py:2204:        if (sl["slot"] == "Outfit" or sl["slot"] in OUTFIT.get("split_slots", [])) and C
+FG.get("body_hold_in_outfit_clips"):
+  scripts\assemble_own.py:2205:            # in the GAME Body_'s prefab blend weights do not survive (BreastRest / OwnB
+odyFit read 0 on the rig, garment-fit 2026-10-26, harness `shapes`) and Girl.UpdateBodyClothBlendShapes copies Body_'s
+weights BY NAME
+  scripts\assemble_own.py:2206:            # onto every garment: the coat and the robot plates rendered at their standa
+rd-body base (torn coat, tangled plates). Customize curves on FBX/Body_ DO work (every Mask_* key reads 100):
+  scripts\assemble_own.py:2207:            # hold every body_hold_shapes key (+ OwnBodyFit) at its prefab weight in EVE
+RY option of the Outfit slot.
+  scripts\assemble_own.py:2208:            _hk = {k_: w_ / 100.0 for k_, w_ in _HOLD_W.items() if k_ in body_shape_name
+s}
+  scripts\assemble_own.py:2209:            for o in opts:
+  scripts\assemble_own.py:2210:                for k_, w_ in _hk.items():
+  scripts\assemble_own.py:2211:                    o["body_keys"][k_] = max(w_, o["body_keys"].get(k_, 0.0))
+  scripts\assemble_own.py:2212:            REPORT["body_hold_in_outfit_clips"] = {k_: round(w_ * 100.0, 1) for k_, w_ i
+n _hk.items()}
+  scripts\assemble_own.py:2273:        if _G:
+  scripts\assemble_own.py:2274:            REPORT["garment_only_keys_on_body"].setdefault("curves_on_Body_", {})[sl["sl
+ot"]] = len(_G)
+  scripts\assemble_own.py:2275:        if curves_:
+  scripts\assemble_own.py:2276:            SLOT_CLIP[sl["slot"]] = clip(f"Customize_{sl['slot']}", flt_c=curves_)
+  scripts\assemble_own.py:2277:            CLIPS.append(SLOT_CLIP[sl["slot"]])
+> scripts\assemble_own.py:2278:    REPORT["outfit_clips"] = [c for c in REPORT.get("outfit_clips", [])] + [f"Customize_
+{sl['slot']}" for sl in OUTFIT["slots"]]
+  scripts\assemble_own.py:2279:ANIM = P.component(R, "Animation")
+  scripts\assemble_own.py:2280:an = w.default("Animation")
+  scripts\assemble_own.py:2281:an.update({"m_Enabled": True, "m_Animation": pptr(CLIP_TPOSE), "m_Animations": [pptr(c)
+for c in CLIPS], "m_WrapMode": 0,
+  scripts\assemble_own.py:2282:           "m_PlayAutomatically": False, "m_AnimatePhysics": False, "m_CullingType": 0})
+  scripts\assemble_own.py:2283:P.fill(ANIM, an)
+  scripts\assemble_own.py:2284:
+  scripts\assemble_own.py:2285:# =============================================================================== Rig (r
+oot), Rig@Puppet, Rig@ClothColliders
+  scripts\assemble_own.py:2286:GIRL = reserve_script(R, "Girl")
+  scripts\assemble_own.py:2287:RIG = reserve_script(R, "Rig")
+  scripts\assemble_own.py:2288:FACE = reserve_script(f"{R}/Face", "FaceRig")
+> scripts\assemble_own.py:2289:slots = sk["slots"]
+  scripts\assemble_own.py:2290:rig_vals = {"m_girl": pptr(GIRL), "root": pptr(P.tr(f"{R}/FBX/Armature")), "m_clothRig":
+ pptr(RIG_CC),
+  scripts\assemble_own.py:2291:            "penis": [pptr(bone_tr(f"shaft{k}_base")) for k in range(1, 8)], "penisRoot"
+: pptr(bone_tr("shaftRoot_base")), "penisBarrel": pptr(bone_tr("penisBarrel_base")),
+  scripts\assemble_own.py:2292:            "penisTip": pptr(bone_tr("penisTip_base"))}
+> scripts\assemble_own.py:2293:for k, b in slots.items():
+  scripts\assemble_own.py:2294:    rig_vals[k] = pptr(bone_tr(b))
+  scripts\assemble_own.py:2295:for k, b in sk["markers"].items():
+  scripts\assemble_own.py:2296:    if isinstance(b, str) and k in ("lFootPad", "rFootPad", "lFootHeel", "rFootHeel", "l
+Nipple", "rNipple", "lTesticle", "rTesticle"):
+  scripts\assemble_own.py:2297:        rig_vals[k] = pptr(bone_tr(b))
+  scripts\assemble_own.py:2298:# body bones (+ twistTarget copies as managed references)
+  scripts\assemble_own.py:2299:refids, bb_list = [], []
+  scripts\assemble_own.py:2300:by_name = {e["boneName"]: e for e in sk["body_bones"]}
+  scripts\assemble_own.py:2301:def bodybone(e, twist_rid):
+  scripts\assemble_own.py:2360:for wpath, wname in WRAP_MADE.items():                                   # the eyelid wr
+appers belong to the face bones too
+  scripts\assemble_own.py:2361:    fb["L" if wname.startswith("L_") else "R"].append(pptr(P.tr(wpath)))
+  scripts\assemble_own.py:2362:rig_vals["faceBonesL"], rig_vals["faceBonesR"], rig_vals["faceBonesM"] = fb["L"], fb["R"
+], fb["M"]
+  scripts\assemble_own.py:2363:REPORT["rig_face_lists"] = {k: len(v) for k, v in rig_vals.items() if k in FACE_LISTS or
+ k.startswith("faceBones")}
+  scripts\assemble_own.py:2364:fill_script(RIG, "Rig", rig_vals)
+> scripts\assemble_own.py:2365:pup_slots = {"hips": "Hips", "spine": "Spine", "chest": "Chest", "neck": "Chest/Neck", "
+head": "Head",
+  scripts\assemble_own.py:2366:             "lUpperArm": "UpperArm_L", "lForearm": "Forearm_L", "lHand": "Hand_L", "rUp
+perArm": "UpperArm_R",
+  scripts\assemble_own.py:2367:             "rForearm": "Forearm_R", "rHand": "Hand_R", "lThigh": "Thigh_L", "lCalf": "
+Calf_L", "lFoot": "Foot_L",
+  scripts\assemble_own.py:2368:             "rThigh": "Thigh_R", "rCalf": "Calf_R", "rFoot": "Foot_R", "lBreast": "Brea
+st_L", "rBreast": "Breast_R",
+  scripts\assemble_own.py:2369:             "lAss": "Ass_L", "rAss": "Ass_R"}
+  scripts\assemble_own.py:2370:fill_script(RIG_PUP, "Rig", {"m_girl": pptr(GIRL), "root": pptr(P.tr(f"{R}/Puppet")),
+> scripts\assemble_own.py:2371:                             **{k: pptr(P.tr(f"{R}/Puppet/{v}")) for k, v in pup_slots.i
+tems()}})
+  scripts\assemble_own.py:2372:fill_script(PM, "PuppetMaster", {"m_girl": pptr(GIRL), "muscles": []}, enabled=0)
+   # shipped: disabled in the prefab
+> scripts\assemble_own.py:2373:cc_slots = {"hips": "pelvis_CC", "spine": "spine_CC", "spine2": "spine2_CC", "spine3": "
+spine3_CC", "spine4": "spine4_CC",
+  scripts\assemble_own.py:2374:            "neck": "neck_CC", "head": "head_CC", "lThigh": "lThigh_CC", "rThigh": "rThi
+gh_CC", "lCalf": "lCalf_CC",
+  scripts\assemble_own.py:2375:            "rCalf": "rCalf_CC", "lUpperArm": "lUpperArm_CC", "rUpperArm": "rUpperArm_CC
+", "lForearm": "lForearm_CC",
+  scripts\assemble_own.py:2376:            "rForearm": "rForearm_CC", "lHand": "lHand_CC", "rHand": "rHand_CC", "lFoot"
+: "lFoot_CC", "rFoot": "rFoot_CC",
+  scripts\assemble_own.py:2377:            "lBreast": "lBreast_CC", "rBreast": "rBreast_CC", "lAss": "lAss_CC", "rAss":
+ "rAss_CC"}
+  scripts\assemble_own.py:2378:fill_script(RIG_CC, "Rig", {"m_girl": pptr(GIRL), "root": pptr(P.tr(f"{R}/ClothColliders
+")),
+> scripts\assemble_own.py:2379:                            **{k: pptr(P.tr(f"{R}/ClothColliders/{v}")) for k, v in cc_s
+lots.items()},
+  scripts\assemble_own.py:2380:                            "penis": [pptr(P.tr(f"{R}/ClothColliders/{n}")) for n in PEN
+IS_CC]})
+  scripts\assemble_own.py:2381:# lip-sync visemes (OVR viseme ids SIL..U): the game drives the face controls named here
+ (FaceRig MCtrl names: Jaw,
+  scripts\assemble_own.py:2382:# UpperLip, LowerLip, Lip_L, Lip_R, Lips_Press, Lips_Pout, Tongue; values in control uni
+ts, (x, y, z) per axis).
+  scripts\assemble_own.py:2383:# Authored for her mouth: jaw drops for open vowels, lip press for bilabials, pout for r
+ounded vowels, tongue for TH.
+  scripts\assemble_own.py:2384:def vis(name, **vals):
+  scripts\assemble_own.py:2385:    vs = []
+  scripts\assemble_own.py:2386:    for k, v in vals.items():
+  scripts\assemble_own.py:2387:        x, y, z = (v if isinstance(v, tuple) else (v, 0.0, 0.0))
+  scripts\assemble_own.py:2456:    _XW_ANATOMY_RX = _re.compile(r"^(body_.*|hair.*|eyes?|tongue|teeth.*|eyebrows?|eyela
+sh(es)?|brows?|lashes|mouth|scalp)$",
+  scripts\assemble_own.py:2457:                                 _re.I)                           # same rule as crosswe
+ar_gate.ANATOMY_RX
+  scripts\assemble_own.py:2458:    _xw_all = CFG.get("crosswear_all_accessories", True)
+  scripts\assemble_own.py:2459:    _xw_feat = set(CFG.get("crosswear_body_features", []))
+  scripts\assemble_own.py:2460:    _xw_c = [it["item"] for ob, it in (OUT_ITEMS.items() if OUTFIT else [])
+> scripts\assemble_own.py:2461:             if not it.get("extra") and ob not in AC_ITEMS and (_xw_all or _slot_of.get(
+ob) not in NON_CLOTHING_SLOTS)]
+  scripts\assemble_own.py:2462:    if _xw_all:
+  scripts\assemble_own.py:2463:        _xw_c += [ex["name"] for ex in CFG.get("extras", [])]      # extras never get a
+collider (horns, nails, decals)
+  scripts\assemble_own.py:2464:    gv["m_extraClothingNames"] = CFG.get("extra_clothing_names", [n_ for i_, n_ in enume
+rate(_xw_c) if n_ not in _xw_c[:i_]
+  scripts\assemble_own.py:2465:                                         and f"{R}/FBX/{n_}" in P.nodes and not _XW_ANAT
+OMY_RX.match(n_) and n_ not in _xw_feat])
+  scripts\assemble_own.py:2466:    if _xw_all:                                                     # Robotic_Head & co:
+ their colliders become clothing
+  scripts\assemble_own.py:2467:        gv["m_clothingColliders"] = gv["m_clothingColliders"] + [pptr(a) for a in FEATUR
+E_AC]
+> scripts\assemble_own.py:2468:        # ...and their slots' clips become clothing clips (Customize_Horns, Customize_He
+adLeds), else visibility and the
+  scripts\assemble_own.py:2469:        # clip-fix masks keyed in them stay behind on a swap (clip-fix agent 2026-10-19)
+; only Hair stays non-clothing
+> scripts\assemble_own.py:2470:        gv["m_nonClothingAnims"] = [pptr(SLOT_CLIP[s]) for s in CFG.get("crosswear_keep_
+slots", ["Hair"]) if s in SLOT_CLIP]
+  scripts\assemble_own.py:2471:    REPORT["crosswear_extra_clothing_names"] = gv["m_extraClothingNames"]
+  scripts\assemble_own.py:2472:if BC.get("garments"):
+  scripts\assemble_own.py:2473:    gv["m_clothingCloths"] = [pptr(p_) for p_ in BC["garments"]]      # B_Jacket, B_Slee
+ves, B_Pants, B_Harness
+  scripts\assemble_own.py:2474:# =============================================================================== voice
+(own_voice.py, references/24)
+  scripts\assemble_own.py:2475:# empty voice set (no files in the drop folder yet) -> attach adds nothing and the Girl
+stays silent, bundle unchanged
+  scripts\assemble_own.py:2476:if CFG.get("voice", True):
+  scripts\assemble_own.py:2477:    import own_voice
+  scripts\assemble_own.py:2478:    _vdir = CFG.get("voice_dir", os.path.join(OWN, "voice", "out"))
+
+
+PS D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets> Select-String -Path "scripts\bulk_import.py" -Pattern "rigmap\s*=|rigmap|RIGMAP" -Context 3,5
+
+  scripts\bulk_import.py:412:    B = m["build_dir"]; O = m.get("own_dir") or os.path.join(B, "own")
+  scripts\bulk_import.py:413:    src, s2 = m["source_blend"], m.get("stage2_blend") or os.path.join(B, "stage2.blend")
+  scripts\bulk_import.py:414:    s2r = m.get("stage2_report") or os.path.join(B, "stage2_report.json")
+> scripts\bulk_import.py:415:    rigmap = m.get("rig_mapping") or os.path.join(m["_dir"], "rig_mapping.json")
+  scripts\bulk_import.py:416:    bones = m.get("deform_bones") or os.path.join(m["_dir"], "deform_bones.json")
+  scripts\bulk_import.py:417:    ex = m.get("export_dir") or os.path.join(B, "export")
+  scripts\bulk_import.py:418:    bk = m.get("bake_dir") or os.path.join(O, "bake")
+  scripts\bulk_import.py:419:    tex = m.get("tex_dir") or os.path.join(O, "tex")
+  scripts\bulk_import.py:420:    inv = m.get("inventory") or os.path.join(O, "blend_inventory.json")
+  scripts\bulk_import.py:435:        [bl(cfg, src, "blender/blend_inventory.py", inv, os.path.join(O, "blend_inventory.
+md")),
+  scripts\bulk_import.py:436:         bl(cfg, src, "blend_rig_dump.py", m["armature"], bones),
+  scripts\bulk_import.py:437:         bl(cfg, src, "blender/dump_outfit_switches.py", swf)], "S0")
+> scripts\bulk_import.py:438:    add("S0.map", "AUTO", None, ["S0.dump"], [bones], [rigmap], [py(cfg, "rig_automap.py",
+ bones, rigmap)], "S0 (AI review when issues)")
+  scripts\bulk_import.py:439:    cfgs = [mfile(m, k) for k in ("stage2", "body", "assemble", "face_profile", "presets",
+ "bake_jobs") if m["configs"].get(k)]
+> scripts\bulk_import.py:440:    add("CFG", "AI", None, ["S0.map"], [inv, rigmap], cfgs, [], "playbook 2 + data/templat
+e_*.json")
+  scripts\bulk_import.py:441:    add("S1", "AUTO", "blender", ["CFG"], [src, mfile(m, "stage2")], [s2, s2r],
+  scripts\bulk_import.py:442:        [bl(cfg, src, "blender/stage2_tpose_bake.py", mfile(m, "stage2"))], "S1")
+  scripts\bulk_import.py:443:    # SHION_BAKED / SHION_GAME are the fixed names stage2_tpose_bake.py creates (00b A27)
+  scripts\bulk_import.py:444:    add("S2", "AUTO", "blender", ["S1"], [s2], [os.path.join(ex, "manifest.json"), os.path
+.join(O, "frames"), os.path.join(ex, "keys")],
+  scripts\bulk_import.py:445:        [bl(cfg, s2, "blender/export_blend_meshes.py", "SHION_BAKED", "SHION_GAME", ex),
+  scripts\bulk_import.py:448:         bl(cfg, s2, "blender/export_shape_keys.py", s2r, os.path.join(ex, "keys"),
+  scripts\bulk_import.py:449:            "--cfg=" + str(mfile(m, "stage2")), *m.get("shape_key_objects", []))], "S2")
+  scripts\bulk_import.py:450:    add("S3", "AUTO", None, ["S2"], [os.path.join(ex, "manifest.json")], [os.path.join(O,
+"skeleton.json")],
+> scripts\bulk_import.py:451:        [py(cfg, "own_rig.py", os.path.join(ex, "manifest.json"), s2r, rigmap,
+  scripts\bulk_import.py:452:            os.path.join(ex, m["body_object"] + ".npz"), O)], "S3 (00b A1-A3)")
+  scripts\bulk_import.py:453:    recipes = os.path.join(m["_dir"], "face_pose_recipes.json")
+  scripts\bulk_import.py:454:    add("S4", "AUTO", "blender", ["S3"], [mfile(m, "face_profile")], [os.path.join(O, "fac
+e_pose_sim.json")],
+  scripts\bulk_import.py:455:        [py(cfg, "make_face_recipes.py", os.path.join(ex, "manifest.json"), mfile(m, "face
+_profile"), recipes),
+  scripts\bulk_import.py:456:         {"op": "write", "path": os.path.join(O, "head_report_native.json"), "text": '{"he
+ad_translation": [0, 0, 0]}'},
+
+
+PS D:\TFA\tfa-character-import-toolsets_v1.2\tfa-character-import-toolsets>
